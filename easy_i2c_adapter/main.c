@@ -2,6 +2,7 @@
  * main.c
  * rev 1.0 Aug 2024 shabaz
  * rev 1.1 Nov 2024 shabaz
+ *  - added getiolvl/readmem/writemem commands 2026-01-30 Fukunaga
  * ****************************/
 
 #include <stdio.h>
@@ -59,6 +60,9 @@ uint8_t led_hold_off = 0;
 uint8_t led_hold_on = 0;
 uint8_t led_counter = 0;
 uint8_t led_counter_default = 0;
+int mem_dev_addr = -1;      // writemem/readmem で明示されたデバイスアドレス（-1 = 省略）
+uint8_t mem_reg = 0;        // writemem で指定されたレジスタ
+uint8_t do_mem_write = 0;   // writemem モードフラグ
 
 /************* functions ***************/
 
@@ -352,6 +356,25 @@ scan_uart_input(void) {
     return(0);
 }
 
+/* --- ヘルパー関数 --- */
+/* read from device memory: write reg (no stop) then read len bytes */
+int i2c_read_mem_addr(uint8_t dev_addr, uint8_t reg, uint8_t *buf, int len) {
+    int ret;
+    // send register address with repeated-start (i2c_write_blocking(..., true))
+    ret = i2c_write_blocking(i2c_port, dev_addr, &reg, 1, true);
+    if (ret == PICO_ERROR_GENERIC) return PICO_ERROR_GENERIC;
+    ret = i2c_read_blocking(i2c_port, dev_addr, buf, len, false);
+    return ret;
+}
+/* write to device memory: send reg followed by data in single write */
+int i2c_write_mem_addr(uint8_t dev_addr, uint8_t reg, uint8_t *buf, int len) {
+    if (len > 255) return PICO_ERROR_GENERIC;
+    uint8_t tmp[257];
+    tmp[0] = reg;
+    memcpy(&tmp[1], buf, len);
+    return i2c_write_blocking(i2c_port, dev_addr, tmp, len + 1, false);
+}
+
 int decode_token(char *token) {
     unsigned int val;
     int ioport, ioval; // used for the iowrite and ioread commands
@@ -457,13 +480,155 @@ int decode_token(char *token) {
         }
         return TOKEN_RESULT_LINE_COMPLETE;
     }
+    if (strncmp(token, "getiolvl:", 9) == 0) {
+        sscanf(token, "getiolvl:%d", &ioport);
+        port_valid = check_ioport_valid(ioport);
+        if (port_valid) {
+            ioval = gpio_get_out_level(ioport);
+            if (m2m_resp) {
+                if (ioval) {
+                    putchar('1');
+                } else {
+                    putchar('0');
+                }
+                putchar(M2M_RESPONSE_OK_CHAR);
+            } else {
+                COL_BLUE;
+                printf("Port %d out level was %d\n", ioport, ioval);
+                COL_RESET;
+            }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    /* --- decode_token に追加するコマンド処理の一例 --- */
+    /* readmem: (formats)
+    - readmem:0x20,0x01,4   -> device 0x20, reg 0x01, length 4
+    - readmem:0x01,4        -> use current i2c_addr, reg 0x01, length 4
+    */
+    if (strncmp(token, "readmem:", 8) == 0) {
+        int a = 0, r = 0, l = 0;
+        int n = sscanf(token + 8, "%i,%i,%i", &a, &r, &l);
+        int target_dev;
+        int retval;
+        if (n == 3) {
+            target_dev = a;
+            mem_reg = (uint8_t) r;
+            int len = l;
+            retval = i2c_read_mem_addr((uint8_t)target_dev, mem_reg, byte_buffer, len);
+            if (m2m_resp) {
+                if (input_mode == MODE_ASCII) {
+                    if (retval == PICO_ERROR_GENERIC) {
+                        putchar(M2M_RESPONSE_PROT_ERR_CHAR);
+                    } else {
+                        print_buf_m2m_ascii(byte_buffer, len);
+                    }
+                } else {
+                    print_buf_m2m_bin(byte_buffer, len);
+                }
+            } else {
+                if (retval == PICO_ERROR_GENERIC) {
+                    COL_RED; printf("Protocol error reading bytes from mem!\n"); COL_RESET;
+                } else {
+                    print_buf_hex(byte_buffer, len);
+                }
+            }
+        } else if (n == 2) {
+            // format: readmem:reg,len  -> use current i2c_addr
+            target_dev = i2c_addr;
+            mem_reg = (uint8_t) a;
+            int len = r;
+            retval = i2c_read_mem_addr((uint8_t)target_dev, mem_reg, byte_buffer, len);
+            if (m2m_resp) {
+                if (input_mode == MODE_ASCII) {
+                    if (retval == PICO_ERROR_GENERIC) {
+                        putchar(M2M_RESPONSE_PROT_ERR_CHAR);
+                    } else {
+                        print_buf_m2m_ascii(byte_buffer, len);
+                    }
+                } else {
+                    print_buf_m2m_bin(byte_buffer, len);
+                }
+            } else {
+                if (retval == PICO_ERROR_GENERIC) {
+                    COL_RED; printf("Protocol error reading bytes from mem!\n"); COL_RESET;
+                } else {
+                    print_buf_hex(byte_buffer, len);
+                }
+            }
+        } else {
+            if (m2m_resp) putchar(M2M_RESPONSE_ERR_CHAR);
+            else { COL_RED; printf("Invalid readmem syntax\n"); COL_RESET; }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+
+    /* writemem: (formats)
+    - writemem:0x20,0x01   -> device 0x20, reg 0x01  (then send bytes via existing send flow: bytes:N + hex tokens)
+    - writemem:0x01        -> use current i2c_addr, reg 0x01
+    実際の送信は既存の TOKEN_PROGRESS_SEND 処理にフックして行う（データは byte_buffer に蓄積される） */
+    if (strncmp(token, "writemem:", 9) == 0) {
+        int a = 0, r = 0;
+        int n = sscanf(token + 9, "%i,%i", &a, &r);
+        if (n == 2) {
+            mem_dev_addr = a;
+            mem_reg = (uint8_t) r;
+        } else if (n == 1) {
+            mem_dev_addr = -1; // use current i2c_addr
+            mem_reg = (uint8_t) a;
+        } else {
+            if (m2m_resp) putchar(M2M_RESPONSE_ERR_CHAR);
+            else { COL_RED; printf("Invalid writemem syntax\n"); COL_RESET; }
+            return TOKEN_RESULT_LINE_COMPLETE;
+        }
+        // caller must set bytes:N first to set expected_num, then provide bytes tokens on the line(s).
+        do_mem_write = 1;
+        // enter send mode to collect bytes (re-use the existing TOKEN_PROGRESS_SEND flow)
+        byte_buffer_index = 0;
+        token_progress = TOKEN_PROGRESS_SEND;
+        do_repeated_start = 0; // for writemem we do a single write, no repeated start
+        return TOKEN_RESULT_OK;
+    }
+
+    /* --- TOKEN_PROGRESS_SEND ブロック（送信完了時に実際の書き込みを行う箇所）の修正例）---
+    現在の SEND 処理の中で、byte_buffer に expected_num バイト揃ったときに送っています。
+    その直前（"if (byte_buffer_index == expected_num) {" の箇所）に下記の分岐を追加します。 */
+    if (do_mem_write) {
+        int target = (mem_dev_addr == -1) ? i2c_addr : mem_dev_addr;
+        if (m2m_resp == 0) {
+            COL_BLUE; printf("Writemem: dev=0x%02X reg=0x%02X len=%d\n", target, mem_reg, expected_num); COL_RESET;
+            print_buf_hex(byte_buffer, expected_num);
+        }
+        retval = i2c_write_mem_addr((uint8_t)target, mem_reg, byte_buffer, expected_num);
+        // reset mem write flags
+        do_mem_write = 0;
+        mem_dev_addr = -1;
+    } else {
+        /* 既存の通常の i2c_write_blocking 処理（変更なし） */
+        if (do_repeated_start) {
+            retval = i2c_write_blocking(i2c_port, i2c_addr, byte_buffer, expected_num, true);
+        } else {
+            retval = i2c_write_blocking(i2c_port, i2c_addr, byte_buffer, expected_num, false);
+        }
+    }
+
     if (strncmp(token, "ioread:", 7) == 0) {
-        sscanf(token, "ioread:%d", &ioport);
+        // support optional parameter: ioread:<port> or ioread:<port>,pullup
+        char opt[16] = {0};
+        // try parse with optional string after comma
+        if (sscanf(token, "ioread:%d,%15s", &ioport, opt) < 1) {
+            // fallback parsing
+            sscanf(token, "ioread:%d", &ioport);
+            opt[0] = '\0';
+        }
         port_valid = check_ioport_valid(ioport);
         if (port_valid) {
             gpio_init(ioport);
             gpio_set_dir(ioport, GPIO_IN);
-            gpio_pull_up(ioport); // avoid floating input, so enable pull-up
+            // Only enable internal pull-up if explicitly requested:
+            // e.g. "ioread:6,pullup"
+            if (opt[0] != '\0' && strcmp(opt, "pullup") == 0) {
+                gpio_pull_up(ioport);
+            }
             ioval = gpio_get(ioport);
             if(m2m_resp) {
                 if (ioval) {
@@ -720,3 +885,4 @@ main(void)
         sleep_ms(1);
     }
 }
+
